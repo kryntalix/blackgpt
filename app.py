@@ -1,16 +1,19 @@
+import json
 import re
+ 
+import requests
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, StreamingResponse
-from g4f.client import Client
 from g4f import Provider
+from g4f.client import Client
  
 app = FastAPI()
 client = Client()
  
 MODELS = ["gpt-4o-mini", "gpt-4o", "deepseek-chat", "llama-3.3-70b"]
+POLLINATIONS_URL = "https://text.pollinations.ai/openai"
  
-# Ba'zi providerlar xato o'rniga oddiy matn qaytaradi ("Sign up and repeat...").
-# Shunday javoblar aniqlansa, keyingi variantga o'tiladi.
+# Ba'zi servislar xato o'rniga oddiy matn qaytaradi ("Sign up and repeat...").
 JUNK = re.compile(
     r"sign ?up|log ?in|repeat (you|your) request|rate limit|too many requests|"
     r"captcha|cloudflare|access denied|api key|subscribe|unauthorized|try again later",
@@ -18,17 +21,50 @@ JUNK = re.compile(
 )
  
  
-def candidates(model):
-    out = [(model, None)] + [(m, None) for m in MODELS if m != model]
-    for name, m in [
-        ("PollinationsAI", "openai"),
-        ("PollinationsAI", "gpt-4o-mini"),
-        ("Yqcloud", "gpt-4"),
-    ]:
+def pollinations_stream(msgs):
+    """Pollinations: ro'yxatdan o'tish va kalit talab qilinmaydi."""
+    r = requests.post(
+        POLLINATIONS_URL,
+        json={"model": "openai", "messages": msgs, "stream": True},
+        stream=True,
+        timeout=60,
+    )
+    r.raise_for_status()
+    for line in r.iter_lines(decode_unicode=True):
+        if not line or not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if data == "[DONE]":
+            break
+        try:
+            choices = json.loads(data).get("choices") or []
+        except ValueError:
+            continue
+        if choices:
+            t = (choices[0].get("delta") or {}).get("content")
+            if t:
+                yield t
+ 
+ 
+def g4f_stream(model, provider, msgs):
+    kw = {"provider": provider} if provider else {}
+    stream = client.chat.completions.create(
+        model=model, messages=msgs, stream=True, **kw
+    )
+    for ch in stream:
+        t = ch.choices[0].delta.content if ch.choices else None
+        if t:
+            yield t
+ 
+ 
+def sources(model, msgs):
+    yield lambda: pollinations_stream(msgs)
+    for m in [model] + [x for x in MODELS if x != model]:
+        yield lambda m=m: g4f_stream(m, None, msgs)
+    for name, m in [("PollinationsAI", "openai"), ("Yqcloud", "gpt-4")]:
         p = getattr(Provider, name, None)
         if p:
-            out.append((m, p))
-    return out
+            yield lambda m=m, p=p: g4f_stream(m, p, msgs)
  
  
 @app.get("/")
@@ -57,17 +93,10 @@ async def chat(req: Request):
  
     def gen():
         last = None
-        for m, p in candidates(model):
+        for src in sources(model, msgs):
             buf, started = "", False
             try:
-                kw = {"provider": p} if p else {}
-                stream = client.chat.completions.create(
-                    model=m, messages=msgs, stream=True, **kw
-                )
-                for ch in stream:
-                    t = ch.choices[0].delta.content if ch.choices else None
-                    if not t:
-                        continue
+                for t in src():
                     if started:
                         yield t
                         continue
@@ -89,3 +118,4 @@ async def chat(req: Request):
         yield f"Hech bir variant javob bermadi. Oxirgi javob/xato: {last or ''}"
  
     return StreamingResponse(gen(), media_type="text/plain; charset=utf-8")
+ 
