@@ -1,0 +1,4 @@
+g4f
+fastapi
+uvicorn
+curl_cffi
